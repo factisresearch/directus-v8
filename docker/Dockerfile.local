@@ -1,0 +1,157 @@
+# Purpose: keep Directus 8 running temporarily with fixes for CVE-2026-109618
+# and CVE-2026-109619, without migrating the application to PHP 8.
+# PHP, Composer and Node/Yarn run entirely inside Docker.
+#
+# Build from the repository root (required by COPY api/, app/, packages/):
+# docker build --platform linux/amd64 -f docker/Dockerfile.local -t medilyse/directus-v8:php74-patched .
+#
+# PHP 7.4 has an official source backport, but no corresponding updated official
+# PHP Docker image. This third-party image builds PHP 7.4.33 with that backport.
+# The digest pins the reviewed image. `php -v` still reports 7.4.33 and does NOT
+# identify the patch level on its own.
+# Source: https://github.com/mpyw/php-eol-CVE-2026-109618-109619/releases/tag/v1.1.0
+# PHP fix: https://github.com/php/php-src/commit/712e60f9edfd03f0960fc4fc3c2c375f42b90aa2
+# This addresses the two CVEs specifically; PHP 7.4 otherwise remains end-of-life.
+ARG RUNTIME_IMAGE=ghcr.io/mpyw/php-eol-cve-2026-109618-109619@sha256:84e87ad92400dfa7ae66aa475a5ccdc4d9c90e87e81f97ceb652c54a35b43d90
+
+# -----------------------------------------------------------------------------
+# 1. Build the admin interface
+# -----------------------------------------------------------------------------
+# Node 14 supports the legacy Vue/Webpack toolchain. The final image only needs
+# the static assets, not Node, Yarn or node_modules.
+FROM node:14.21.3-bullseye AS admin
+WORKDIR /build/app
+
+# Copy dependency manifests separately so frontend source changes can reuse
+# the installation cache. Keep the Yarn lockfile unchanged.
+COPY app/package.json app/yarn.lock ./
+RUN yarn install --frozen-lockfile --non-interactive
+
+COPY app/ ./
+RUN yarn build
+
+# -----------------------------------------------------------------------------
+# 2. Obtain tools and metadata for installing PHP dependencies
+# -----------------------------------------------------------------------------
+# Only the Composer executable is copied later. It runs under our PHP 7.4
+# runtime with the same extensions as the application.
+FROM composer:2.2 AS composer_binary
+
+# The API has no committed Composer lockfile and requires cache/cache from
+# dev-master, which now requires PHP 8.2. The old Directus image provides the
+# historical cache package metadata as a fixed reference.
+# ONLY composer.lock is copied from here, not PHP 7.3 or application code.
+FROM directus/directus@sha256:d77a6264bf65444846e127935ca682393ec59f5b04107f677ec2e73eaf7a01f0 AS legacy_metadata
+
+# -----------------------------------------------------------------------------
+# 3. Prepare the shared PHP 7.4 runtime for Composer and the final application
+# -----------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE} AS runtime
+
+# The base image includes Apache/PHP, but not all extensions needed by Directus.
+# git/unzip support Composer downloads; rsync seeds config and upload volumes.
+# The lib*-dev packages are required to compile the image and ZIP extensions.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        unzip \
+        rsync \
+        libpng-dev \
+        libjpeg-dev \
+        libzip-dev \
+        libfreetype6-dev \
+        libmagickwand-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# GD/EXIF handle images and metadata; ZIP handles archives; PDO-MySQL/MySQLi
+# provide database access. PHP 7.4 uses --with-freetype/--with-jpeg instead of
+# the old *-dir options. ZIP detects libzip automatically; --with-libzip is gone.
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install -j"$(nproc)" gd zip exif pdo_mysql mysqli
+
+# PEAR 1.10.17 fixes decoding of chunked HTTP responses from PECL.
+# The older client in the base image passes chunk markers to its XML parser,
+# causing Imagick metadata lookups to fail. Pin the PHP 7.4-compatible fix.
+# --loose skips the obsolete Archive_Tar 1.4.4 recommendation while retaining
+# required dependency checks; the base image already includes Archive_Tar 1.4.14.
+RUN pear upgrade --loose PEAR-1.10.17
+
+# Redis and Imagick come from PECL, pinned to the tested extension versions.
+RUN pecl install redis-5.3.7 imagick-3.7.0 \
+    && docker-php-ext-enable redis imagick \
+    && rm -rf /tmp/pear
+
+# Reuse the existing Apache configuration and startup/volume helpers.
+# Move the helpers to /usr/local/bin, leaving /var/directus/bin for the
+# application CLI. Configure only Apache/PHP: the old "initial" step would
+# download Composer again and install Prestissimo, which is incompatible
+# with Composer 2.
+COPY docker/images/apache/rootfs/ /
+RUN chmod +x /var/directus/bin/* \
+    && cp /var/directus/bin/* /usr/local/bin/ \
+    && rm -rf /var/directus/bin \
+    && directus-setup configure-apache \
+    && directus-setup configure-php
+
+# Preserve the existing configuration through environment variables.
+ENV DIRECTUS_USE_ENV=1
+
+# -----------------------------------------------------------------------------
+# 4. Install API dependencies under the actual PHP 7.4 runtime
+# -----------------------------------------------------------------------------
+FROM runtime AS api
+COPY --from=composer_binary /usr/bin/composer /usr/local/bin/composer
+COPY --from=legacy_metadata /var/directus/composer.lock /tmp/legacy-composer.lock
+
+# Composer runs as root during the image build. Local packages must be copied:
+# symlinks to /build/packages would be broken in the final image.
+# A separate COMPOSER_HOME avoids inheriting global legacy plugins.
+ENV COMPOSER_ALLOW_SUPERUSER=1 \
+    COMPOSER_MIRROR_PATH_REPOS=1 \
+    COMPOSER_HOME=/tmp/composer
+WORKDIR /build/api
+
+# Preserve relative paths: api/composer.json references ../packages/.
+COPY packages/ /build/packages/
+COPY api/ ./
+
+# Adjust the manifest ONLY IN THIS BUILD STAGE, leaving the checkout untouched:
+# - use the historical cache package metadata from the old lockfile;
+# - explicitly assign dev-master to local packages because .git is excluded;
+# - include S3 dependencies as in the previous Directus image.
+# Other PHP dependencies are still resolved at build time.
+COPY docker/prepare-local-composer.php /tmp/prepare-local-composer.php
+RUN php /tmp/prepare-local-composer.php
+
+# Omit development packages and Composer plugins; optimize the autoloader.
+# Then verify the actual PHP and extension requirements rather than bypassing them.
+RUN composer install \
+    --no-dev \
+    --prefer-dist \
+    --no-interaction \
+    --no-plugins \
+    --optimize-autoloader
+RUN composer check-platform-reqs --no-dev
+
+# -----------------------------------------------------------------------------
+# 5. Assemble the final Directus image
+# -----------------------------------------------------------------------------
+# Start from the shared runtime, not the build stages: Composer, its download
+# cache and the frontend toolchain are not carried into the final image.
+FROM runtime
+WORKDIR /var/directus
+COPY --from=api --chown=www-data:www-data /build/api/ ./
+COPY --from=admin --chown=www-data:www-data /build/app/dist/ ./public/admin/
+
+# Apache needs write access to configuration, uploads and logs.
+# Seed copies under /backup populate new volumes at startup without overwriting
+# existing files.
+RUN mkdir -p config public/uploads logs \
+    && chown -R www-data:www-data config public/uploads logs \
+    && directus-setup backup-volumes
+
+# Persistent data lives in volumes outside the container's writable layer.
+# The existing entrypoint checks auth variables, seeds volumes and starts Apache.
+VOLUME ["/var/directus/config", "/var/directus/public/uploads"]
+ENTRYPOINT ["directus-entrypoint"]
+CMD ["apache2-foreground"]

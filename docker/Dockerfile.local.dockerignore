@@ -1,0 +1,15 @@
+**/.git
+**/.DS_Store
+**/node_modules
+**/vendor
+**/.env
+**/.env.*
+app/dist
+api/public/admin
+api/config/*
+!api/config/_example.php
+api/logs/*
+api/public/uploads/*
+_directus-v8-build
+docker/context
+docker/temp

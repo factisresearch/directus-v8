@@ -545,7 +545,7 @@ if (!function_exists('get_file_info')) {
                 $iptc = iptcparse($meta['APP13']);
                 $info['caption'] = $iptc['2#120'][0];
                 $info['title'] = $iptc['2#005'][0];
-                $info['tags'] = implode($iptc['2#025'], ',');
+                $info['tags'] = implode(',', $iptc['2#025']);
             }
         }
 
